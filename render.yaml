@@ -1,8 +1,9 @@
 services:
   - type: web
     name: telegram-gpt-bot
-    env: python
+    runtime: python
     plan: free
+    pythonVersion: 3.11         # impose l’utilisation de Python 3.11
     buildCommand: "pip install -r requirements.txt"
     startCommand: "python bot.py"
     autoDeploy: true
