@@ -1,0 +1,4 @@
+echo "3.11" > .python-version
+git add .python-version
+git commit -m "Fix Python version for Render"
+git push
