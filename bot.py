@@ -2,34 +2,31 @@
 bot.py
 ---------
 
-Ce module contient un assistant Telegram qui répond aux questions immobilières
-juridiques françaises en se présentant comme « Mathieu Lantoine, agent
-immobilier spécialisé à Nice (06) ». L'application utilise la bibliothèque
-`python-telegram-bot` pour gérer les messages entrants via le mode longue
-interrogation (long polling) et `openai` pour générer des réponses basées sur
-le modèle GPT‑4o. Les variables sensibles sont lues depuis un fichier `.env`.
+Ce module définit un assistant Telegram qui répond aux questions
+immobilières juridiques françaises en se présentant comme « Mathieu
+Lantoine ». Il utilise la bibliothèque `python‑telegram‑bot` pour gérer
+les messages via une boucle de longue interrogation (long polling) et
+la bibliothèque `openai` pour interroger le modèle GPT‑4o. Les
+variables sensibles sont lues depuis un fichier `.env`.
 
 Fonctionnalités :
-* Filtrage de mots‑clés pour notifier l'administrateur en cas de terme
-  sensible (« procès », « avocat », « litige »).
-* Vérification que le sujet concerne l'immobilier ; sinon, réponse par défaut
-  indiquant la spécialisation du bot.
-* Ajout automatique d'un disclaimer juridique à chaque réponse.
-* Point de terminaison `/health` exposé via Flask pour le monitoring.
+    • Filtrage de mots clés sensibles (comme « procès », « avocat »,
+      « litige »), avec notification facultative de l’administrateur ;
+    • Vérification que les questions concernent l’immobilier, sinon
+      réponse polie indiquant la spécialisation de l’assistant ;
+    • Ajout systématique d’un disclaimer juridique à toutes les réponses ;
+    • Exposition d’un endpoint `/health` via Flask permettant à Render de
+      vérifier que le service est actif.
 
 Pour démarrer localement :
 
-```
-cp .env.example .env  # modifiez le contenu de .env selon vos besoins
-python bot.py
-```
 """
 
 import logging
 import os
+import threading
 from typing import Optional
 
-import openai
 from dotenv import load_dotenv
 from flask import Flask, jsonify
 from telegram import Update
@@ -41,13 +38,27 @@ from telegram.ext import (
     filters,
 )
 
+# Importer la version asynchrone du client OpenAI. À partir de la
+# version 1.x de la bibliothèque, `ChatCompletion` n’est plus exposé
+# directement et il faut utiliser `AsyncOpenAI`. Cette importation
+# lève une erreur si la bibliothèque est trop ancienne, auquel cas
+# l’utilisateur devra pinner la version dans requirements.txt.
+try:
+    from openai import AsyncOpenAI  # type: ignore
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError(
+        "Impossible d’importer AsyncOpenAI. Assurez‑vous d’utiliser la "
+        "version >=1.0 du SDK OpenAI ou pinner `openai==0.28` dans "
+        "requirements.txt."
+    ) from exc
+
 
 # Charger les variables d'environnement depuis .env
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID")  # peut être None
+TELEGRAM_TOKEN: Optional[str] = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
+ADMIN_CHAT_ID: Optional[str] = os.getenv("ADMIN_CHAT_ID")  # peut être None
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError(
@@ -58,7 +69,9 @@ if not OPENAI_API_KEY:
         "La variable OPENAI_API_KEY est absente. Veuillez l'ajouter à votre fichier .env."
     )
 
-openai.api_key = OPENAI_API_KEY
+# Instancier le client OpenAI asynchrone à partir de la clé API. La
+# version asynchrone permet d'appeler l'API de manière non bloquante.
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Configuration du logger
 logging.basicConfig(
@@ -83,13 +96,17 @@ SENSITIVE_KEYWORDS = ["procès", "avocat", "litige"]
 
 
 async def call_openai(prompt: str) -> str:
-    """Appelle l'API OpenAI GPT‑4o pour générer une réponse.
+    """Appelle l'API OpenAI pour générer une réponse en utilisant la nouvelle interface.
+
+    La fonction construit un message système définissant le rôle de l'assistant,
+    puis envoie la demande au modèle via le client asynchrone. En cas d'erreur,
+    un message par défaut est renvoyé et l'erreur est journalisée.
 
     Args:
-        prompt: question posée par l'utilisateur (en français).
+        prompt: Question posée par l'utilisateur (en français).
 
     Returns:
-        Réponse générée par le modèle GPT‑4o.
+        Le contenu de la réponse générée par le modèle.
     """
     system_message = (
         "Vous êtes Mathieu Lantoine, agent immobilier spécialisé à Nice (06). "
@@ -99,19 +116,16 @@ async def call_openai(prompt: str) -> str:
         "français, expliquez poliment que vous ne pouvez répondre qu'à ce type de question."
     )
     try:
-        completion = await openai.ChatCompletion.acreate(
+        response = await openai_client.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_message},
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
+                {"role": "user", "content": prompt},
             ],
             temperature=0.3,
             max_tokens=800,
         )
-        return completion.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip()
     except Exception as exc:
         logger.exception("Erreur lors de l'appel à l'API OpenAI: %s", exc)
         return (
@@ -209,13 +223,39 @@ def create_app() -> Flask:
 
 
 def main() -> None:
-    """Point d'entrée principal de l'application."""
+    """Point d'entrée principal de l'application.
+
+    Cette fonction configure et lance à la fois le serveur Flask (pour
+    l'endpoint de santé) et le bot Telegram. Le serveur Flask est lancé
+    dans un thread séparé afin de ne pas bloquer la boucle
+    d'interrogation du bot. Render peut ainsi détecter un port ouvert
+    pendant que le bot fonctionne en mode polling.
+    """
+    # Créer l'application Flask et démarrer un thread HTTP séparé
+    flask_app = create_app()
+
+    def run_flask() -> None:
+        # Render fournit la variable d'environnement PORT pour le service
+        port_str = os.environ.get("PORT", "10000")
+        try:
+            port = int(port_str)
+        except ValueError:
+            port = 10000
+        flask_app.run(host="0.0.0.0", port=port, threaded=True)
+
+    # Démarrer le serveur Flask dans un thread daemon
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Construire l'application Telegram
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Enregistrer les handlers
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("help", help_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
+    )
     application.add_error_handler(error_handler)
 
     # Démarrer le bot en mode longue interrogation
@@ -225,5 +265,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     # Lancer à la fois Flask et le bot
-    # Le serveur Flask est lancé dans un thread séparé par python-telegram-bot
     main()
