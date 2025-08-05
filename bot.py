@@ -21,6 +21,16 @@ Fonctionnalités :
 Pour démarrer localement :
 
 """
+# Après avoir chargé TELEGRAM_TOKEN, OPENAI_API_KEY et ADMIN_CHAT_ID :
+# Définir le modèle et les paramètres OpenAI avec des valeurs par défaut
+# économiques. Ces valeurs peuvent être remplacées via les variables
+# d'environnement OPENAI_MODEL et OPENAI_MAX_TOKENS.
+
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+try:
+    OPENAI_MAX_TOKENS: int = int(os.getenv("OPENAI_MAX_TOKENS", "400"))
+except ValueError:
+    OPENAI_MAX_TOKENS = 400
 
 import logging
 import os
@@ -100,7 +110,8 @@ async def call_openai(prompt: str) -> str:
     """Appelle l’API OpenAI pour générer une réponse en détectant la bonne interface.
 
     La fonction crée un message système définissant le rôle de l’assistant,
-    puis utilise la version appropriée du SDK OpenAI. En cas d’erreur,
+    puis utilise soit la nouvelle API (>= 1.0) via AsyncOpenAI, soit l’ancienne
+    API (ChatCompletion.acreate) pour les versions < 1.0. En cas d’erreur,
     elle renvoie un message par défaut et journalise l’exception.
     """
     system_message = (
@@ -114,26 +125,26 @@ async def call_openai(prompt: str) -> str:
         if async_openai_available:
             # Nouvelle interface (>= 1.0)
             response = await openai_client.chat.completions.create(  # type: ignore[union-attr]
-                model="gpt-4o",
+                model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=OPENAI_MAX_TOKENS,
             )
             return response.choices[0].message.content.strip()
         else:
             # Ancienne interface (< 1.0)
             import openai  # type: ignore
             completion = await openai.ChatCompletion.acreate(  # type: ignore[attr-defined]
-                model="gpt-4o",
+                model=OPENAI_MODEL,
                 messages=[
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=OPENAI_MAX_TOKENS,
             )
             return completion.choices[0].message.content.strip()
     except Exception as exc:
