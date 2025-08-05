@@ -38,22 +38,17 @@ from telegram.ext import (
     filters,
 )
 
-# Importer la version asynchrone du client OpenAI. À partir de la
-# version 1.x de la bibliothèque, `ChatCompletion` n’est plus exposé
-# directement et il faut utiliser `AsyncOpenAI`. Cette importation
-# lève une erreur si la bibliothèque est trop ancienne, auquel cas
-# l’utilisateur devra pinner la version dans requirements.txt.
+# Déterminer si nous utilisons la nouvelle interface OpenAI (>= 1.0) ou l’ancienne.
+# openai.AsyncOpenAI n’est disponible qu’à partir de la version 1.0.
+async_openai_available = False
 try:
     from openai import AsyncOpenAI  # type: ignore
-except Exception as exc:  # pragma: no cover
-    raise RuntimeError(
-        "Impossible d’importer AsyncOpenAI. Assurez‑vous d’utiliser la "
-        "version >=1.0 du SDK OpenAI ou pinner `openai==0.28` dans "
-        "requirements.txt."
-    ) from exc
+    async_openai_available = True
+except ImportError:
+    import openai  # type: ignore
+    AsyncOpenAI = None  # type: ignore
 
-
-# Charger les variables d'environnement depuis .env
+# Charger les variables d’environnement depuis .env
 load_dotenv()
 
 TELEGRAM_TOKEN: Optional[str] = os.getenv("TELEGRAM_TOKEN")
@@ -69,9 +64,15 @@ if not OPENAI_API_KEY:
         "La variable OPENAI_API_KEY est absente. Veuillez l'ajouter à votre fichier .env."
     )
 
-# Instancier le client OpenAI asynchrone à partir de la clé API. La
-# version asynchrone permet d'appeler l'API de manière non bloquante.
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+# Instancier le client OpenAI en fonction de la version disponible.
+if async_openai_available:
+    # Client asynchrone pour les versions récentes du SDK
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)  # type: ignore[name-defined]
+else:
+    # Pour les versions < 1.0, initialiser la clé API globale
+    import openai  # type: ignore
+    openai.api_key = OPENAI_API_KEY  # type: ignore[attr-defined]
+    openai_client = None  # placeholder pour éviter un NameError
 
 # Configuration du logger
 logging.basicConfig(
@@ -96,36 +97,45 @@ SENSITIVE_KEYWORDS = ["procès", "avocat", "litige"]
 
 
 async def call_openai(prompt: str) -> str:
-    """Appelle l'API OpenAI pour générer une réponse en utilisant la nouvelle interface.
+    """Appelle l’API OpenAI pour générer une réponse en détectant la bonne interface.
 
-    La fonction construit un message système définissant le rôle de l'assistant,
-    puis envoie la demande au modèle via le client asynchrone. En cas d'erreur,
-    un message par défaut est renvoyé et l'erreur est journalisée.
-
-    Args:
-        prompt: Question posée par l'utilisateur (en français).
-
-    Returns:
-        Le contenu de la réponse générée par le modèle.
+    La fonction crée un message système définissant le rôle de l’assistant,
+    puis utilise la version appropriée du SDK OpenAI. En cas d’erreur,
+    elle renvoie un message par défaut et journalise l’exception.
     """
     system_message = (
         "Vous êtes Mathieu Lantoine, agent immobilier spécialisé à Nice (06). "
         "Vous répondez en tant qu'assistant virtuel de Mathieu Lantoine. "
         "Vous devez répondre en français de manière factuelle, professionnelle et modeste. "
-        "Si une question sort du domaine de l'immobilier ou du droit immobilier "
-        "français, expliquez poliment que vous ne pouvez répondre qu'à ce type de question."
+        "Si une question sort du domaine de l'immobilier ou du droit immobilier français, "
+        "expliquez poliment que vous ne pouvez répondre qu'à ce type de question."
     )
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=800,
-        )
-        return response.choices[0].message.content.strip()
+        if async_openai_available:
+            # Nouvelle interface (>= 1.0)
+            response = await openai_client.chat.completions.create(  # type: ignore[union-attr]
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=800,
+            )
+            return response.choices[0].message.content.strip()
+        else:
+            # Ancienne interface (< 1.0)
+            import openai  # type: ignore
+            completion = await openai.ChatCompletion.acreate(  # type: ignore[attr-defined]
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=800,
+            )
+            return completion.choices[0].message.content.strip()
     except Exception as exc:
         logger.exception("Erreur lors de l'appel à l'API OpenAI: %s", exc)
         return (
@@ -135,14 +145,7 @@ async def call_openai(prompt: str) -> str:
 
 
 def contains_sensitive_keyword(text: str) -> Optional[str]:
-    """Recherche des mots clés sensibles dans le texte.
-
-    Args:
-        text: texte à analyser.
-
-    Returns:
-        Le mot clé détecté ou None s'il n'y en a pas.
-    """
+    """Recherche des mots clés sensibles dans le texte."""
     lower_text = text.lower() if text else ""
     for keyword in SENSITIVE_KEYWORDS:
         if keyword in lower_text:
@@ -153,7 +156,7 @@ def contains_sensitive_keyword(text: str) -> Optional[str]:
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Répond à la commande /start."""
     welcome_message = (
-        "Bonjour! Je suis l'assistant virtuel de Mathieu Lantoine, agent immobilier "
+        "Bonjour ! Je suis l'assistant virtuel de Mathieu Lantoine, agent immobilier "
         "spécialisé à Nice (06). Posez-moi vos questions sur l'immobilier, le droit "
         "immobilier, la fiscalité immobilière ou les SCI et je ferai de mon mieux "
         "pour vous répondre."
@@ -180,17 +183,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     user_text = update.message.text.strip() if update.message.text else ""
 
-    # Vérifier les mots clés sensibles et notifier l'administrateur
+    # Vérifier les mots clés sensibles et notifier l’administrateur
     sensitive = contains_sensitive_keyword(user_text)
     if sensitive and ADMIN_CHAT_ID:
         try:
             notify_message = (
-                f"Mot clé sensible détecté: '{sensitive}' dans le message de "
+                f"Mot clé sensible détecté : '{sensitive}' dans le message de "
                 f"{update.effective_user.first_name} ({update.effective_user.id})."
             )
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=notify_message)
         except Exception as exc:
-            logger.warning("Impossible d'envoyer la notification admin: %s", exc)
+            logger.warning("Impossible d'envoyer la notification admin : %s", exc)
 
     # Générer une réponse via OpenAI
     response = await call_openai(user_text)
@@ -212,7 +215,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def create_app() -> Flask:
-    """Crée et configure l'application Flask pour l'exposition de l'endpoint /health."""
+    """Crée et configure l’application Flask pour l’endpoint /health."""
     app = Flask(__name__)
 
     @app.route("/health", methods=["GET"])
@@ -223,19 +226,14 @@ def create_app() -> Flask:
 
 
 def main() -> None:
-    """Point d'entrée principal de l'application.
+    """Lance à la fois le serveur Flask et le bot Telegram.
 
-    Cette fonction configure et lance à la fois le serveur Flask (pour
-    l'endpoint de santé) et le bot Telegram. Le serveur Flask est lancé
-    dans un thread séparé afin de ne pas bloquer la boucle
-    d'interrogation du bot. Render peut ainsi détecter un port ouvert
-    pendant que le bot fonctionne en mode polling.
+    Flask s’exécute dans un thread séparé pour exposer l’endpoint /health,
+    tandis que le bot fonctionne en mode longue interrogation (polling).
     """
-    # Créer l'application Flask et démarrer un thread HTTP séparé
     flask_app = create_app()
 
     def run_flask() -> None:
-        # Render fournit la variable d'environnement PORT pour le service
         port_str = os.environ.get("PORT", "10000")
         try:
             port = int(port_str)
@@ -243,11 +241,10 @@ def main() -> None:
             port = 10000
         flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
-    # Démarrer le serveur Flask dans un thread daemon
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # Démarrer Flask en arrière-plan
+    threading.Thread(target=run_flask, daemon=True).start()
 
-    # Construire l'application Telegram
+    # Construire l’application Telegram
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     # Enregistrer les handlers
@@ -264,5 +261,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # Lancer à la fois Flask et le bot
     main()
