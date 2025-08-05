@@ -1,4 +1,4 @@
-python-telegram-bot[socks]==20.7
+python‑telegram‑bot==22.3
 openai>=1.11
 python-dotenv>=1.0
 Flask>=2.3
